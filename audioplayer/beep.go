@@ -3,7 +3,6 @@ package audioplayer
 import (
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -11,22 +10,22 @@ import (
 
 	"github.com/faiface/beep"
 	"github.com/faiface/beep/effects"
-	"github.com/faiface/beep/flac"
-	"github.com/faiface/beep/mp3"
 	"github.com/faiface/beep/speaker"
-	"github.com/faiface/beep/vorbis"
-	"github.com/faiface/beep/wav"
 )
+
+var _ Player = (*BeepPlayer)(nil)
 
 type BeepPlayer struct {
 	mu sync.Mutex
 
-	file     *os.File
 	streamer beep.StreamSeekCloser
 	format   beep.Format
 
 	ctrl   *beep.Ctrl
 	volume *effects.Volume
+	done   chan struct{}
+
+	queued bool
 
 	state  State
 	path   string
@@ -42,7 +41,11 @@ var (
 	beepSpeakerSampleRate beep.SampleRate
 )
 
-const beepOutputSampleRate = beep.SampleRate(44100)
+const (
+	beepOutputSampleRate = beep.SampleRate(44100)
+
+	ffmpegPCMPrecision = 2 // bytes per sample, int16
+)
 
 func NewBeepPlayer() (*BeepPlayer, error) {
 	return &BeepPlayer{
@@ -59,19 +62,13 @@ func (p *BeepPlayer) Open(ctx context.Context, path string) error {
 		return ErrClosed
 	}
 
-	if p.streamer != nil {
-		if p.ctrl != nil {
-			speaker.Lock()
-			p.ctrl.Streamer = nil
-			speaker.Unlock()
-			p.ctrl = nil
-		}
-		_ = p.streamer.Close()
-		p.streamer = nil
+	if err := p.closeOpenFileLocked(); err != nil {
+		return err
 	}
-	if p.file != nil {
-		_ = p.file.Close()
-		p.file = nil
+
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return fmt.Errorf("audio path is empty")
 	}
 
 	abs, err := filepath.Abs(path)
@@ -79,42 +76,34 @@ func (p *BeepPlayer) Open(ctx context.Context, path string) error {
 		return err
 	}
 
-	f, err := os.Open(abs)
-	if err != nil {
-		return err
-	}
-
-	streamer, format, err := decodeByExt(abs, f)
-	if err != nil {
-		_ = f.Close()
-		return err
-	}
-
 	if err := ensureBeepSpeaker(); err != nil {
-		_ = streamer.Close()
-		_ = f.Close()
 		return err
 	}
 
-	p.file = f
+	streamer, format, err := decodeWithFFmpegPCM(ctx, abs)
+	if err != nil {
+		return err
+	}
+
 	p.streamer = streamer
 	p.format = format
 	p.path = abs
 	p.state = StateReady
+	p.done = make(chan struct{})
+	p.queued = false
 
-	p.ctrl = &beep.Ctrl{
-		Streamer: p.playbackStreamer(),
-		Paused:   true,
-	}
+	p.rebuildChainLocked(true)
 
-	p.volume = &effects.Volume{
-		Streamer: p.ctrl,
-		Base:     2,
-		Volume:   volumeToBeep(p.lastVolume),
-		Silent:   p.muted,
-	}
-
-	speaker.Play(p.volume)
+	fmt.Printf(
+		"[audio] path=%s decoder=ffmpeg sample_rate=%d speaker_rate=%d channels=%d precision=%d len=%d duration=%s\n",
+		abs,
+		format.SampleRate,
+		beepSpeakerSampleRate,
+		format.NumChannels,
+		format.Precision,
+		streamer.Len(),
+		format.SampleRate.D(streamer.Len()),
+	)
 
 	return nil
 }
@@ -126,13 +115,37 @@ func (p *BeepPlayer) Play() error {
 	if p.closed {
 		return ErrClosed
 	}
-	if p.streamer == nil || p.ctrl == nil {
+	if p.streamer == nil || p.ctrl == nil || p.volume == nil {
 		return ErrNoFileOpen
 	}
+
+	// If Play is called after natural completion, rewind and queue again.
+	if p.streamer.Len() > 0 && p.streamer.Position() >= p.streamer.Len() {
+		if err := p.streamer.Seek(0); err != nil {
+			return fmt.Errorf("beep seek: %w", err)
+		}
+
+		p.done = make(chan struct{})
+		p.queued = false
+		p.rebuildChainLocked(true)
+	}
+
+	done := p.done
 
 	speaker.Lock()
 	p.ctrl.Paused = false
 	speaker.Unlock()
+
+	if !p.queued {
+		p.queued = true
+
+		speaker.Play(beep.Seq(
+			p.volume,
+			beep.Callback(func() {
+				p.finish(done)
+			}),
+		))
+	}
 
 	p.state = StatePlaying
 	return nil
@@ -171,14 +184,15 @@ func (p *BeepPlayer) Stop() error {
 	speaker.Lock()
 	if p.ctrl != nil {
 		p.ctrl.Paused = true
-	}
-	if p.ctrl != nil {
 		p.ctrl.Streamer = nil
 	}
+
 	err := p.streamer.Seek(0)
-	if p.ctrl != nil {
-		p.ctrl.Streamer = p.playbackStreamer()
-	}
+
+	p.done = make(chan struct{})
+	p.queued = false
+	p.rebuildChainLocked(true)
+
 	speaker.Unlock()
 
 	if err != nil {
@@ -200,22 +214,42 @@ func (p *BeepPlayer) Seek(pos time.Duration) error {
 		return ErrNoFileOpen
 	}
 
+	if pos < 0 {
+		pos = 0
+	}
+
 	samples := p.format.SampleRate.N(pos)
+	if p.streamer.Len() > 0 && samples > p.streamer.Len() {
+		samples = p.streamer.Len()
+	}
+
+	wasPaused := true
+	if p.ctrl != nil {
+		wasPaused = p.ctrl.Paused
+	}
 
 	speaker.Lock()
-	wasPaused := p.ctrl != nil && p.ctrl.Paused
 	if p.ctrl != nil {
 		p.ctrl.Streamer = nil
 	}
+
 	err := p.streamer.Seek(samples)
-	if p.ctrl != nil {
-		p.ctrl.Streamer = p.playbackStreamer()
-		p.ctrl.Paused = wasPaused
-	}
+
+	p.rebuildChainLocked(wasPaused)
 	speaker.Unlock()
 
 	if err != nil {
 		return fmt.Errorf("beep seek: %w", err)
+	}
+
+	// If the previous stream had completed, allow Play to queue again.
+	if p.streamer.Len() == 0 || p.streamer.Position() < p.streamer.Len() {
+		select {
+		case <-p.done:
+			p.done = make(chan struct{})
+			p.queued = false
+		default:
+		}
 	}
 
 	return nil
@@ -248,6 +282,10 @@ func (p *BeepPlayer) Duration() (time.Duration, error) {
 	}
 	if p.streamer == nil {
 		return 0, ErrNoFileOpen
+	}
+
+	if p.streamer.Len() <= 0 {
+		return 0, nil
 	}
 
 	return p.format.SampleRate.D(p.streamer.Len()), nil
@@ -321,9 +359,32 @@ func (p *BeepPlayer) Muted() (bool, error) {
 	return p.muted, nil
 }
 
+func (p *BeepPlayer) Wait() error {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return ErrClosed
+	}
+	if p.streamer == nil {
+		p.mu.Unlock()
+		return ErrNoFileOpen
+	}
+
+	done := p.done
+	p.mu.Unlock()
+
+	if done == nil {
+		return ErrNoFileOpen
+	}
+
+	<-done
+	return nil
+}
+
 func (p *BeepPlayer) State() State {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	return p.state
 }
 
@@ -335,32 +396,92 @@ func (p *BeepPlayer) Close() error {
 		return nil
 	}
 
+	_ = p.closeOpenFileLocked()
+
+	p.closed = true
+	p.state = StateClosed
+
+	return nil
+}
+
+func (p *BeepPlayer) closeOpenFileLocked() error {
 	if p.ctrl != nil {
 		speaker.Lock()
 		p.ctrl.Paused = true
 		p.ctrl.Streamer = nil
 		speaker.Unlock()
+		p.ctrl = nil
 	}
 
+	p.volume = nil
+	p.queued = false
+
+	if p.done != nil {
+		select {
+		case <-p.done:
+		default:
+			close(p.done)
+		}
+		p.done = nil
+	}
+
+	var firstErr error
+
 	if p.streamer != nil {
-		_ = p.streamer.Close()
+		if err := p.streamer.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
 		p.streamer = nil
 	}
 
-	if p.file != nil {
-		_ = p.file.Close()
-		p.file = nil
-	}
+	p.path = ""
+	p.format = beep.Format{}
 
-	p.closed = true
-	p.state = StateClosed
-	return nil
+	return firstErr
 }
 
-func (p *BeepPlayer) playbackStreamer() beep.Streamer {
+func (p *BeepPlayer) finish(done chan struct{}) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.state != StateClosed {
+		p.state = StateStopped
+	}
+
+	p.queued = false
+
+	if done != nil {
+		select {
+		case <-done:
+		default:
+			close(done)
+		}
+	}
+}
+
+func (p *BeepPlayer) rebuildChainLocked(paused bool) {
+	p.ctrl = &beep.Ctrl{
+		Streamer: p.playbackStreamerLocked(),
+		Paused:   paused,
+	}
+
+	p.volume = &effects.Volume{
+		Streamer: p.ctrl,
+		Base:     2,
+		Volume:   volumeToBeep(p.lastVolume),
+		Silent:   p.muted || p.lastVolume == 0,
+	}
+}
+
+func (p *BeepPlayer) playbackStreamerLocked() beep.Streamer {
+	if p.streamer == nil {
+		return beep.Silence(-1)
+	}
+
 	if p.format.SampleRate == beepSpeakerSampleRate {
 		return p.streamer
 	}
+
 	return beep.Resample(4, p.format.SampleRate, beepSpeakerSampleRate, p.streamer)
 }
 
@@ -378,24 +499,63 @@ func ensureBeepSpeaker() error {
 
 	beepSpeakerReady = true
 	beepSpeakerSampleRate = beepOutputSampleRate
+
 	return nil
 }
 
-func decodeByExt(path string, f *os.File) (beep.StreamSeekCloser, beep.Format, error) {
-	ext := strings.ToLower(filepath.Ext(path))
+// decodeWithFFmpegPCM decodes any ffmpeg-supported input into normalized PCM:
+//
+//   - sample rate: 44100 Hz
+//   - channels: stereo
+//   - format: signed 16-bit little-endian PCM
+//
+// Then it converts the PCM into Beep's [][2]float64 sample format.
+type pcmMemoryStreamer struct {
+	samples [][2]float64
+	pos     int
+	err     error
+}
 
-	switch ext {
-	case ".mp3":
-		return mp3.Decode(f)
-	case ".wav":
-		return wav.Decode(f)
-	case ".ogg":
-		return vorbis.Decode(f)
-	case ".flac":
-		return flac.Decode(f)
-	default:
-		return nil, beep.Format{}, fmt.Errorf("unsupported audio file extension %q", ext)
+func (s *pcmMemoryStreamer) Stream(out [][2]float64) (n int, ok bool) {
+	if s.pos >= len(s.samples) {
+		return 0, false
 	}
+
+	n = copy(out, s.samples[s.pos:])
+	s.pos += n
+
+	return n, s.pos < len(s.samples)
+}
+
+func (s *pcmMemoryStreamer) Err() error {
+	return s.err
+}
+
+func (s *pcmMemoryStreamer) Len() int {
+	return len(s.samples)
+}
+
+func (s *pcmMemoryStreamer) Position() int {
+	return s.pos
+}
+
+func (s *pcmMemoryStreamer) Seek(pos int) error {
+	if pos < 0 {
+		pos = 0
+	}
+	if pos > len(s.samples) {
+		pos = len(s.samples)
+	}
+
+	s.pos = pos
+	return nil
+}
+
+func (s *pcmMemoryStreamer) Close() error {
+	s.samples = nil
+	s.pos = 0
+	s.err = nil
+	return nil
 }
 
 // effects.Volume uses logarithmic-ish volume.
@@ -421,5 +581,6 @@ func volumeToBeep(v float64) float64 {
 			return -8
 		}
 	}
+
 	return x
 }

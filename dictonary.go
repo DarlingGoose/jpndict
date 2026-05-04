@@ -8,6 +8,7 @@ import (
 	"github.com/DarlingGoose/jpndict/audioplayer"
 )
 
+// todo add a cache dir to load data from
 type Dictonary interface {
 	Download() error
 	Search(data string) (*Response, error)
@@ -28,6 +29,19 @@ type Response struct {
 var (
 	ErrNoAudioFileProvided = errors.New("no audio file provided")
 )
+
+func (r *Response) HasAudio() bool {
+	if r.Entry == nil {
+		return false
+	}
+	if r.Entry.Pronunciation == nil {
+		return false
+	}
+	if r.Entry.Pronunciation.Audio == "" {
+		return false
+	}
+	return true
+}
 
 func (r *Response) PlayAudio(wait bool) (*audioplayer.Player, error) {
 	if r.Entry == nil {

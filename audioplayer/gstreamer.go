@@ -20,6 +20,11 @@ type GStreamerPlayer struct {
 	closed   bool
 }
 
+func (p *GStreamerPlayer) Wait() error {
+	//TODO implement me
+	panic("implement me")
+}
+
 var gstInitOnce sync.Once
 
 func NewGStreamerPlayer() (*GStreamerPlayer, error) {

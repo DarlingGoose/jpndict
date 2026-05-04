@@ -2,6 +2,8 @@ package audioplayer
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"time"
 )
 
@@ -21,6 +23,7 @@ type Player interface {
 
 	SetMuted(muted bool) error
 	Muted() (bool, error)
+	Wait() error
 
 	State() State
 	Close() error
@@ -63,4 +66,33 @@ func newAutoPlayer() (Player, error) {
 	}
 
 	return nil, ErrUnsupportedBackend
+}
+
+func PlayAudioFile(player Player, path string, wait bool) error {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return fmt.Errorf("no audio file provided")
+	}
+
+	if err := player.Open(context.Background(), path); err != nil {
+		_ = player.Close()
+		return err
+	}
+
+	if err := player.Play(); err != nil {
+		_ = player.Close()
+		return err
+	}
+
+	if wait {
+		defer player.Close()
+		return player.Wait()
+	}
+
+	go func() {
+		_ = player.Wait()
+		_ = player.Close()
+	}()
+
+	return nil
 }
