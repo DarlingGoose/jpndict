@@ -11,8 +11,13 @@ import (
 // todo add a cache dir to load data from
 type Dictonary interface {
 	Download() error
-	Search(data string) (*Response, error)
-	SearchAll(data string) ([]*Response, error)
+	Search(data Search) (*Response, error)
+	SearchAll(data Search) ([]*Response, error)
+}
+
+type Search struct {
+	Text      string
+	WithAudio bool
 }
 
 type Response struct {

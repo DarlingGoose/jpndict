@@ -18,7 +18,7 @@ func TestNewJiTenDex(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp, err := j.Search("かぜ")
+	resp, err := j.Search(Search{Text: "かぜ"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +54,7 @@ func TestJiTenDex_Search(t *testing.T) {
 	}
 	for _, tc := range tcs {
 		t.Run(tc.search, func(t *testing.T) {
-			resp, err := j.Search(tc.search)
+			resp, err := j.Search(Search{Text: tc.search, WithAudio: true})
 			if err != nil {
 				t.Errorf("failed to find word")
 				return
@@ -176,7 +176,7 @@ func TestSearchAllKeys(t *testing.T) {
 
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {
-			got := searchAllKeys(tc.input, func(s string) bool {
+			got := searchAllKeys(Search{Text: tc.input}, func(s string) bool {
 				return tc.keys[s]
 			}, tc.opts)
 			if tc.wantNil {
@@ -234,7 +234,7 @@ func TestJiTenDex_SearchAll(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			all, err := j.SearchAll(tt.query)
+			all, err := j.SearchAll(Search{Text: tt.query})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -242,7 +242,7 @@ func TestJiTenDex_SearchAll(t *testing.T) {
 				t.Fatal("expected search all results")
 			}
 
-			longest, err := j.SearchAllWithOptions(tt.query, SearchAllOptions{LongestOnly: true})
+			longest, err := j.SearchAllWithOptions(Search{Text: tt.query}, SearchAllOptions{LongestOnly: true})
 			if err != nil {
 				t.Fatal(err)
 			}

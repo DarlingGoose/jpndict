@@ -10,9 +10,9 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/PuerkitoBio/goquery"
 	"github.com/DarlingGoose/jpndict/audio"
 	"github.com/DarlingGoose/jpndict/mdict"
+	"github.com/PuerkitoBio/goquery"
 	"golang.org/x/net/html"
 )
 
@@ -28,7 +28,7 @@ type JiTenDex struct {
 	a            audio.AudioProvider
 }
 
-func (j *JiTenDex) SearchAll(data string) ([]*Response, error) {
+func (j *JiTenDex) SearchAll(data Search) ([]*Response, error) {
 	return j.searchAll(data, SearchAllOptions{LongestOnly: true})
 }
 
@@ -38,23 +38,23 @@ type SearchAllOptions struct {
 
 // SearchAllWithOptions allows callers to choose between all substring matches
 // and the longest non-overlapping matches.
-func (j *JiTenDex) SearchAllWithOptions(data string, opts SearchAllOptions) ([]*Response, error) {
+func (j *JiTenDex) SearchAllWithOptions(data Search, opts SearchAllOptions) ([]*Response, error) {
 	return j.searchAll(data, opts)
 }
 
-func (j *JiTenDex) searchAll(data string, opts SearchAllOptions) ([]*Response, error) {
+func (j *JiTenDex) searchAll(data Search, opts SearchAllOptions) ([]*Response, error) {
 	if j.m == nil {
 		return nil, fmt.Errorf("dictionary not loaded: call Download first")
 	}
 
 	keys := searchAllKeys(data, j.m.HasKey, opts)
 	if len(keys) == 0 {
-		return nil, fmt.Errorf("not found: %s", data)
+		return nil, fmt.Errorf("not found: %s", data.Text)
 	}
 
 	responses := make([]*Response, 0, len(keys))
 	for _, key := range keys {
-		resp, err := j.Search(key)
+		resp, err := j.Search(Search{Text: key, WithAudio: data.WithAudio})
 		if err != nil {
 			return nil, err
 		}
@@ -65,13 +65,13 @@ func (j *JiTenDex) searchAll(data string, opts SearchAllOptions) ([]*Response, e
 	return responses, nil
 }
 
-func searchAllKeys(input string, hasKey func(string) bool, opts SearchAllOptions) []string {
-	parts := phraseTerms(input)
+func searchAllKeys(input Search, hasKey func(string) bool, opts SearchAllOptions) []string {
+	parts := phraseTerms(input.Text)
 	if len(parts) <= 1 {
 		if opts.LongestOnly {
-			return longestDictionaryMatches(input, hasKey)
+			return longestDictionaryMatches(input.Text, hasKey)
 		}
-		return allDictionaryMatches(input, hasKey)
+		return allDictionaryMatches(input.Text, hasKey)
 	}
 
 	keys := make([]string, 0, len(parts))
@@ -189,8 +189,8 @@ func (j *JiTenDex) lookupFollow(key string, maxDepth int) ([]byte, string, error
 	return nil, "", fmt.Errorf("too many redirects for %s", key)
 }
 
-func (j *JiTenDex) Search(search string) (*Response, error) {
-	data, key, err := j.lookupFollow(search, 5)
+func (j *JiTenDex) Search(search Search) (*Response, error) {
+	data, key, err := j.lookupFollow(search.Text, 5)
 	if err != nil {
 		return nil, err
 	}
@@ -198,7 +198,7 @@ func (j *JiTenDex) Search(search string) (*Response, error) {
 	htmlText := strings.TrimRight(string(data), "\x00")
 
 	resp := &Response{
-		Query: search,
+		Query: search.Text,
 		Key:   key,
 		HTML:  htmlText,
 		Text:  StripHTML(htmlText),
@@ -211,8 +211,8 @@ func (j *JiTenDex) Search(search string) (*Response, error) {
 		if resp.Entry.Pronunciation == nil {
 			resp.Entry.Pronunciation = &Pronunciation{}
 		}
-		if j.AudioEnabled {
-			aud, err := j.a.GetAudio(context.Background(), search, resp.Entry.Reading)
+		if j.AudioEnabled && search.WithAudio {
+			aud, err := j.a.GetAudio(context.Background(), search.Text, resp.Entry.Reading)
 			if err == nil {
 				resp.Entry.Pronunciation.Audio = aud.Path
 			} else {
