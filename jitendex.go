@@ -167,6 +167,7 @@ func (j *JiTenDex) Download() error {
 	j.m = m
 	return err
 }
+
 func (j *JiTenDex) lookupFollow(key string, maxDepth int) ([]byte, string, error) {
 	current := key
 
